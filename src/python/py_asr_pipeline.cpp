@@ -129,8 +129,8 @@ auto asr_generation_config_docstring = R"(
     :type lang_to_id: dict[str, int]
 
     :param word_timestamps: If `true` the pipeline will return word-level timestamps.
-                            When enabled word_timestamps=True property should be passed to ASRPipeline constructor:
-                            ASRPipeline("model_path", "CPU", word_timestamps=True)
+                            For Whisper, word_timestamps=True must also be passed to the
+                            ASRPipeline constructor.
     :type word_timestamps: bool
 
     :param alignment_heads: Encoder attention alignment heads used for word-level timestamps prediction.

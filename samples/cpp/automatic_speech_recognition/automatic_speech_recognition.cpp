@@ -27,8 +27,8 @@ int main(int argc, char* argv[]) try {
         ov_config = get_config_for_cache();
     }
 
-    // Word timestamps supported by Whisper models only
-    // Must be passed to ASRPipeline constructor as a property
+    // Word timestamps are supported by Whisper and by Qwen3-ASR for supported languages.
+    // For Whisper, word_timestamps must be passed to the ASRPipeline constructor.
     ov_config.insert(ov::genai::word_timestamps(true));
 
     ov::genai::ASRPipeline pipeline(models_path, device, ov_config);

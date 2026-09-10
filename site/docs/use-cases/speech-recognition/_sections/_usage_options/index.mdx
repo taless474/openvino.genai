@@ -357,6 +357,55 @@ Whisper can predict timestamps for each word of speech, which provides more gran
     </TabItemJS>
 </LanguageTabs>
 
+For Qwen3-ASR word timestamps, OpenVINO GenAI uses the companion Qwen3 Forced Aligner model. Qwen3-ASR and the forced aligner are distributed as separate upstream models. Package the exported forced aligner under a `forced_aligner/` subdirectory of the Qwen3-ASR model directory.
+
+When this component is present, `ASRPipeline` discovers and compiles it automatically at construction using the same device and compile properties as the Qwen3-ASR pipeline. No additional constructor argument is required. Word-level timestamps are then selected with the existing `word_timestamps` generation option.
+
+The `forced_aligner/` component is optional. Qwen3-ASR transcription works normally without it; requesting `word_timestamps=true` without the component raises an error indicating the expected `<model_path>/forced_aligner` location.
+
+OpenVINO GenAI currently supports forced-alignment timestamps for Chinese, Cantonese, English, German, Spanish, French, Italian, Portuguese, and Russian. The Qwen3 Forced Aligner model also supports Japanese and Korean, but their reference segmentation is not yet implemented in OpenVINO GenAI. Forced-aligner word chunks currently have empty `token_ids`.
+
+Because Qwen3-ASR and its forced aligner are distributed separately, prepare the OpenVINO package with two exports. Install `qwen-asr` before exporting:
+
+```sh
+pip install qwen-asr
+
+# Export Qwen3-ASR to the package root.
+optimum-cli export openvino --model Qwen/Qwen3-ASR-0.6B qwen3-asr-ov
+
+# Export its companion aligner into the expected subdirectory.
+optimum-cli export openvino --model Qwen/Qwen3-ForcedAligner-0.6B qwen3-asr-ov/forced_aligner
+```
+
+Pass the resulting `qwen3-asr-ov/` directory to `ASRPipeline` as usual:
+
+<LanguageTabs>
+    <TabItemPython>
+        ```python
+        pipe = openvino_genai.ASRPipeline(model_path, "CPU")
+
+        result = pipe.generate(raw_speech, word_timestamps=True)
+
+        for word in result.words[0]:
+            print(f"[{word.start_ts:.2f}, {word.end_ts:.2f}]: {word.text}")
+        ```
+    </TabItemPython>
+    <TabItemCpp>
+        ```cpp
+        int main() {
+            ov::genai::ASRPipeline pipe(model_path, "CPU");
+
+            auto result = pipe.generate(raw_speech, ov::genai::word_timestamps(true));
+
+            std::cout << std::fixed << std::setprecision(2);
+            for (const auto& word : (*result.words)[0]) {
+                std::cout << "[" << word.start_ts << ", " << word.end_ts << "]: " << word.text << "\n";
+            }
+        }
+        ```
+    </TabItemCpp>
+</LanguageTabs>
+
 #### Long-Form Audio Processing
 
 Whisper models are designed for audio segments up to 30 seconds in length.

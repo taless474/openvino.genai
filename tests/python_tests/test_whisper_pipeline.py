@@ -19,6 +19,7 @@ from optimum.intel.openvino import OVModelForSpeechSeq2Seq
 from huggingface_hub import snapshot_download
 import gc
 import json
+import os
 import typing
 import numpy as np
 import pathlib
@@ -1131,3 +1132,158 @@ def test_streamers(sample_from_dataset, pipelines_fixture, streamer_for_test):
 
     assert expected == result_handler.decode(genai_pipe.get_tokenizer())
     result_handler.reset()
+
+
+# Qwen3-ASR forced-aligner integration tests.
+
+QWEN3_ASR_FA_PARAM = get_model_pipeline_pair_params([(QWEN3_ASR_MODEL_ID, PipelineType.ASR)])
+
+
+def forced_aligner_audio():
+    rng = np.random.default_rng(0)
+    return (rng.standard_normal(16000) * 0.01).astype(np.float32).tolist()
+
+
+def prepare_qwen3_asr_model(model_pipeline_pair):
+    model_id, pipeline_type = model_pipeline_pair[:2]
+    model_path = get_ov_cache_converted_models_dir() / model_id.split("/")[-1]
+    read_asr_model((model_id, model_path), pipeline_type=pipeline_type)
+    return model_path
+
+
+def skip_if_no_forced_aligner_model():
+    path = os.environ.get("QWEN3_FORCED_ALIGNER_MODEL")
+    if not path or not pathlib.Path(path).exists():
+        pytest.skip("Set QWEN3_FORCED_ALIGNER_MODEL to a converted Qwen3-ForcedAligner directory.")
+    return path
+
+
+def _symlink_asr_package(src, pkg):
+    pkg.mkdir()
+    try:
+        for entry in pathlib.Path(src).iterdir():
+            (pkg / entry.name).symlink_to(entry.resolve())
+    except (OSError, NotImplementedError):
+        pytest.skip("forced_aligner packaging test requires symlink support")
+
+
+def prepare_qwen3_asr_model_with_aligner(model_pipeline_pair, tmp_path):
+    # Build the packaged model layout with symlinks to avoid copying model assets.
+    aligner_dir = skip_if_no_forced_aligner_model()
+    pkg = tmp_path / "qwen3-asr-pkg"
+    _symlink_asr_package(prepare_qwen3_asr_model(model_pipeline_pair), pkg)
+    try:
+        (pkg / "forced_aligner").symlink_to(pathlib.Path(aligner_dir).resolve(), target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("forced_aligner packaging test requires symlink support")
+    return pkg
+
+
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_word_timestamps_ctor_default_lifecycle(model_pipeline_pair):
+    path = prepare_qwen3_asr_model(model_pipeline_pair)
+    audio = forced_aligner_audio()
+
+    # Without a timestamp request, the optional aligner is not required.
+    ov_genai.ASRPipeline(path, "CPU").generate(audio, max_new_tokens=4)
+
+    # A constructor default enables word timestamps when not overridden.
+    with pytest.raises(RuntimeError, match="Forced Aligner model assets"):
+        ov_genai.ASRPipeline(path, "CPU", word_timestamps=True).generate(audio, max_new_tokens=4)
+
+    # A per-call request also enables word timestamps.
+    with pytest.raises(RuntimeError, match="Forced Aligner model assets"):
+        ov_genai.ASRPipeline(path, "CPU").generate(audio, word_timestamps=True, max_new_tokens=4)
+
+    # A per-call value overrides the constructor default.
+    ov_genai.ASRPipeline(path, "CPU", word_timestamps=True).generate(audio, word_timestamps=False, max_new_tokens=4)
+
+
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_forced_aligner_incomplete_package_raises(model_pipeline_pair, tmp_path):
+    # A present but incomplete forced_aligner/ package must fail during pipeline construction.
+    pkg = tmp_path / "qwen3-asr-pkg"
+    _symlink_asr_package(prepare_qwen3_asr_model(model_pipeline_pair), pkg)
+    (pkg / "forced_aligner").mkdir()
+    with pytest.raises(RuntimeError):
+        ov_genai.ASRPipeline(pkg, "CPU")
+
+
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_forced_aligner_disabled_does_not_invoke(model_pipeline_pair, tmp_path):
+    path = prepare_qwen3_asr_model_with_aligner(model_pipeline_pair, tmp_path)
+    pipe = ov_genai.ASRPipeline(path, "CPU")
+    result = pipe.generate(forced_aligner_audio(), word_timestamps=False, max_new_tokens=6)
+    assert result.words is None
+
+
+def assert_monotonic_words(result):
+    assert result.words is not None
+    assert isinstance(result.words, list)
+    assert len(result.words) == 1
+    assert len(result.words[0]) > 0
+    for sample_words in result.words:
+        previous_end = -1.0
+        for word in sample_words:
+            assert word.start_ts <= word.end_ts
+            assert word.start_ts >= previous_end - 1e-3
+            assert list(word.token_ids) == []
+            previous_end = word.end_ts
+
+
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_forced_aligner_produces_words(model_pipeline_pair, tmp_path):
+    path = prepare_qwen3_asr_model_with_aligner(model_pipeline_pair, tmp_path)
+    pipe = ov_genai.ASRPipeline(path, "CPU")
+    result = pipe.generate(forced_aligner_audio(), word_timestamps=True, language="English", max_new_tokens=6)
+    assert_monotonic_words(result)
+    assert result.perf_metrics.get_word_level_timestamps_processing_duration().mean > 0
+
+
+# Test the nine implemented alignment languages.
+@pytest.mark.parametrize(
+    "language",
+    [
+        "English", "Chinese", "Cantonese", "German", "Spanish", "French", "Italian",
+        "Portuguese", "Russian",
+    ],
+)
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_forced_aligner_supported_languages(model_pipeline_pair, language, tmp_path):
+    path = prepare_qwen3_asr_model_with_aligner(model_pipeline_pair, tmp_path)
+    pipe = ov_genai.ASRPipeline(path, "CPU")
+    result = pipe.generate(forced_aligner_audio(), word_timestamps=True, language=language, max_new_tokens=6)
+    assert_monotonic_words(result)
+
+
+@pytest.mark.parametrize(
+    "language,message",
+    [
+        ("Japanese", "not yet implemented by OpenVINO GenAI"),
+        ("Korean", "not yet implemented by OpenVINO GenAI"),
+        ("Thai", "not supported by this forced-aligner model"),
+        ("Klingon", "invalid or missing language"),
+    ],
+)
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_forced_aligner_language_errors(model_pipeline_pair, language, message, tmp_path):
+    path = prepare_qwen3_asr_model_with_aligner(model_pipeline_pair, tmp_path)
+    pipe = ov_genai.ASRPipeline(path, "CPU")
+    with pytest.raises(RuntimeError, match=message):
+        pipe.generate(forced_aligner_audio(), word_timestamps=True, language=language, max_new_tokens=6)
+
+
+@pytest.mark.parametrize("model_pipeline_pair", QWEN3_ASR_FA_PARAM)
+def test_qwen3_asr_forced_aligner_multichunk_global_offsets(model_pipeline_pair, tmp_path):
+    path = prepare_qwen3_asr_model_with_aligner(model_pipeline_pair, tmp_path)
+    pipe = ov_genai.ASRPipeline(path, "CPU")
+    # Cross the 180 s timestamped chunk boundary and verify timestamps remain in full-audio time.
+    duration_sec = 182
+    audio = (np.random.default_rng(3).standard_normal(16000 * duration_sec) * 0.01).astype(np.float32).tolist()
+    result = pipe.generate(audio, word_timestamps=True, language="English", max_new_tokens=4)
+    assert_monotonic_words(result)
+    assert any(word.start_ts >= 180.0 for sample_words in result.words for word in sample_words)
+    for sample_words in result.words:
+        for word in sample_words:
+            assert 0.0 <= word.start_ts <= duration_sec + 1.0
+            assert word.end_ts <= duration_sec + 1.0
